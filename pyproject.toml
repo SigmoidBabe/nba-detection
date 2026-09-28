@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "person-inference"
+version = "0.1.0"
+description = "Object detection and segmentation with PT, ONNX, or TensorRT backends"
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+    "numpy",
+    "opencv-python",
+    "shapely",
+]
+
+[project.optional-dependencies]
+ultralytics = ["ultralytics"]
+onnx = ["onnxruntime"]
+tensorrt = ["tensorrt", "pycuda"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["person_inference*"]
