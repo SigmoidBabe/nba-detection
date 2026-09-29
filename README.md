@@ -20,7 +20,7 @@ pip install 'person-inference[onnx] @ git+https://github.com/OWNER/REPO.git'
 pip install 'person-inference[tensorrt] @ git+https://github.com/OWNER/REPO.git'
 ```
 
-TensorRT and PyCUDA require a compatible CUDA environment. The ONNX extra uses `onnxruntime`; install a suitable GPU runtime separately if you need ONNX inference on CUDA.
+TensorRT, PyTorch, and TorchVision require a compatible CUDA environment. The ONNX extra uses `onnxruntime`; install a suitable GPU runtime separately if you need ONNX inference on CUDA.
 
 ## Inference
 
