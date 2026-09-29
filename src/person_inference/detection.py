@@ -75,12 +75,22 @@ class Detector:
         return crop_face
 
     def detect_n_seg(self, image:np.ndarray, labels:list=[], score_threshold:float=0.5, stream=True):
+        """Return one DetectionResults for HWC input, or a list for a batch.
+
+        TensorRT accepts lists/tuples of mixed-size BGR images or NHWC arrays.
+        """
+        is_batch = isinstance(image, (list, tuple)) or (isinstance(image, np.ndarray) and image.ndim == 4)
+        if self.extension == 'onnx' and is_batch:
+            raise ValueError("Batch inference is supported by the TensorRT and PT backends")
+        if is_batch and len(image) == 0:
+            return []
         if len(labels) == 0: labels = self.classes
         clss = self.get_label_idx(labels)
         results = self.model.predict(image, conf=score_threshold, stream=stream, iou=0.4, classes=clss, verbose=False, save=False)
         if self.extension == 'pt':
-            return self.convert_inference(results)
-        return next(iter(results))
+            converted = self.convert_inference(results)
+            return [converted] if is_batch and isinstance(converted, DetectionResults) else converted
+        return list(results) if is_batch else next(iter(results))
     
     def find_max_area(self, object_list, label):
         if isinstance(object_list, DetectionResults):

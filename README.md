@@ -40,3 +40,40 @@ cv2.imwrite("output.jpg", results.plot(image))
 ```
 
 `results.boxes` is a NumPy array with columns `x1, y1, x2, y2, score, class`, plus an optional tracking ID. `results.masks` is a batched boolean array when segmentation masks are available. `results.intersects(other)` and `results.intersection_areas(other)` calculate pairwise box intersections.
+
+## TensorRT batch inference
+
+Pass a list/tuple of BGR images (including different image sizes), or an NHWC
+NumPy array. Batch input always returns a list of `DetectionResults` in input
+order, including for a one-image batch; a single HWC image keeps the original
+single-result return type. An empty batch returns an empty list.
+
+```python
+detector = Detector("model.trt")
+images = [cv2.imread("first.jpg"), cv2.imread("second.jpg")]
+results = detector.detect_n_seg(images, labels=["person"])
+for image, result in zip(images, results):
+    print(result.boxes.shape, result.image_shape)
+```
+
+The engine must expose an explicit NCHW float16/float32 input and raw YOLOv8
+outputs, using linear device tensors. Optimization profile zero controls batch
+limits; dynamic spatial dimensions use that profile's optimum height and width.
+Requests larger than its maximum batch size are split into chunks. Fixed-batch
+engines and profile minima are handled by repeating the last image in a short
+chunk and discarding its extra predictions. An engine built for batch size one
+still executes one image at a time; build an engine with a larger batch dimension
+or profile to execute multiple images together.
+
+Preprocessing normalizes and converts layout across each batch, retaining each
+image's resize/padding metadata. Confidence and class filtering are vectorized
+across the batch. NMS runs independently per image; box transforms and mask
+reconstruction remain vectorized over detections, with bounded mask work chunks.
+Boxes and masks are returned in each original image's coordinates. Detection
+models retain stretch resizing, while segmentation models use letterboxing.
+
+For incremental consumption, `detector.model.predict(images, stream=True)` yields
+one result per image and executes one chunk at a time. `detect_n_seg` collects
+these results into a list. Each TensorRT instance owns reusable pinned host/device
+buffers and one execution context; use separate instances for concurrent calls.
+ONNX batch inference is not supported by this wrapper.

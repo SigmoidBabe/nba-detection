@@ -145,7 +145,93 @@ class BaseDetect:
     def draw(self, orig_image, results):
         return orig_image, results[0].plot(orig_image)
 
-class UtilsDetect:
+class BatchUtils:
+    """Batch transforms keep geometry explicit and numerical work vectorized."""
+
+    letterbox = False
+
+    @staticmethod
+    def as_images(images):
+        if isinstance(images, np.ndarray):
+            if images.ndim == 3:
+                images = [images]
+            elif images.ndim == 4:
+                images = list(images)
+            else:
+                raise ValueError("Expected an HWC image or NHWC image batch")
+        elif isinstance(images, (list, tuple)):
+            images = list(images)
+        else:
+            raise TypeError("Expected an image, a list/tuple of images, or an NHWC array")
+        if any(not isinstance(im, np.ndarray) or im.ndim != 3 or
+               im.shape[2] != 3 or min(im.shape[:2]) <= 0 for im in images):
+            raise ValueError("Each image must be a nonempty HWC BGR array with three channels")
+        return images
+
+    def preprocess_batch(self, images):
+        images = self.as_images(images)
+        count = len(images)
+        shapes = np.asarray([im.shape[:2] for im in images], dtype=np.intp).reshape(count, 2)
+        target = np.asarray([self.model_width, self.model_height])
+        ratios = target / shapes[:, ::-1]
+        pads = np.zeros((count, 2), dtype=np.float32)
+        if self.letterbox:
+            ratios = np.repeat(ratios.min(axis=1, keepdims=True), 2, axis=1)
+            sizes = np.maximum(np.rint(shapes[:, ::-1] * ratios).astype(np.intp), 1)
+            pads = (target - sizes) / 2
+        else:
+            sizes = np.broadcast_to(target, (count, 2))
+        # Resize is per image; color/layout conversion and normalization are batched.
+        resized = np.empty((count, self.model_height, self.model_width, 3), dtype=self.ndtype)
+        for index, image in enumerate(images):
+            size = tuple(int(v) for v in sizes[index])
+            frame = cv2.resize(image, size, interpolation=cv2.INTER_LINEAR)
+            if self.letterbox:
+                left, top = np.rint(pads[index] - 0.1).astype(np.intp)
+                right, bottom = np.rint(pads[index] + 0.1).astype(np.intp)
+                frame = cv2.copyMakeBorder(frame, int(top), int(bottom), int(left), int(right),
+                                           cv2.BORDER_CONSTANT, value=(114, 114, 114))
+            resized[index] = frame
+        tensor = np.ascontiguousarray(resized[..., ::-1].transpose(0, 3, 1, 2))
+        tensor /= np.asarray(255, dtype=self.ndtype)
+        return tensor, shapes, ratios, pads
+
+    def postprocess_batch(self, preds, shapes, ratios, pads,
+                          conf_threshold, iou_threshold, classes=None):
+        predictions = np.asarray(preds[0]).transpose(0, 2, 1)
+        protos = np.asarray(preds[1]) if len(preds) == 2 else None
+        count = len(shapes)
+        if predictions.shape[0] != count or (protos is not None and protos.shape[0] != count):
+            raise ValueError("Output batch size does not match preprocessing metadata")
+        nm = protos.shape[1] if protos is not None else 0
+        class_end = predictions.shape[2] - nm
+        if class_end <= 4:
+            raise ValueError("Expected raw YOLO output with at least one class score")
+        scores = predictions[..., 4:class_end]
+        class_ids = scores.argmax(axis=2)
+        confidence = np.take_along_axis(scores, class_ids[..., None], axis=2)[..., 0]
+        keep = confidence > conf_threshold
+        if classes is not None:
+            keep &= np.isin(class_ids, classes)
+        # Gather once across the batch; NMS must not mix independent images.
+        image_ids, anchor_ids = np.nonzero(keep)
+        candidates = predictions[image_ids, anchor_ids].astype(np.float32, copy=False)
+        confidence = confidence[image_ids, anchor_ids].astype(np.float32, copy=False)
+        class_ids = class_ids[image_ids, anchor_ids]
+        offsets = np.concatenate(([0], np.cumsum(np.bincount(image_ids, minlength=count))))
+        results = []
+        for index in range(count):
+            selected = slice(offsets[index], offsets[index + 1])
+            im0 = np.empty((*shapes[index], 0), dtype=np.uint8)
+            results.append(UtilsSegment._postprocess_candidates(
+                self, candidates[selected], confidence[selected], class_ids[selected],
+                None if protos is None else protos[index], im0,
+                ratios[index], *pads[index], conf_threshold, iou_threshold, False,
+            ))
+        return results
+
+
+class UtilsDetect(BatchUtils):
     def __init__(self, width, height, dtype):
         self.model_height = height
         self.model_width = width
@@ -172,7 +258,9 @@ class UtilsDetect:
 class BaseSegment(BaseDetect):
     """Shared array formatting for segmentation backends."""
 
-class UtilsSegment:
+class UtilsSegment(BatchUtils):
+    letterbox = True
+
     def __init__(self, width, height, dtype):
         self.model_height = height
         self.model_width = width
@@ -231,6 +319,15 @@ class UtilsSegment:
         predictions = predictions[keep].astype(np.float32, copy=False)
         confidence = confidence[keep].astype(np.float32, copy=False)
         class_ids = class_ids[keep]
+        return UtilsSegment._postprocess_candidates(
+            self, predictions, confidence, class_ids, protos, im0, ratio, pad_w, pad_h,
+            conf_threshold, iou_threshold, return_segments,
+        )
+
+    def _postprocess_candidates(self, predictions, confidence, class_ids, protos,
+                                im0, ratio, pad_w, pad_h, conf_threshold,
+                                iou_threshold, return_segments):
+        nm = protos.shape[0] if protos is not None else 0
         if not len(predictions):
             masks = None if protos is None else np.empty((0, *im0.shape[:2]), dtype=bool)
             return np.empty((0, 6), dtype=np.float32), [], masks
