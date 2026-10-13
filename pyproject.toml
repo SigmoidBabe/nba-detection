@@ -17,7 +17,7 @@ dependencies = [
 [project.optional-dependencies]
 ultralytics = ["ultralytics"]
 onnx = ["onnxruntime"]
-tensorrt = ["tensorrt", "pycuda"]
+tensorrt = ["tensorrt", "numba", "numba-cuda"]
 
 [tool.setuptools.packages.find]
 where = ["src"]

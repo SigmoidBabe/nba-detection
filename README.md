@@ -20,7 +20,7 @@ pip install 'person-inference[onnx] @ git+https://github.com/OWNER/REPO.git'
 pip install 'person-inference[tensorrt] @ git+https://github.com/OWNER/REPO.git'
 ```
 
-TensorRT and PyCUDA require a compatible CUDA environment. The ONNX extra uses `onnxruntime`; install a suitable GPU runtime separately if you need ONNX inference on CUDA.
+TensorRT and Numba CUDA require a compatible CUDA environment, including the CUDA toolkit for kernel compilation. The ONNX extra uses `onnxruntime`; install a suitable GPU runtime separately if you need ONNX inference on CUDA.
 
 ## Inference
 
@@ -65,15 +65,120 @@ chunk and discarding its extra predictions. An engine built for batch size one
 still executes one image at a time; build an engine with a larger batch dimension
 or profile to execute multiple images together.
 
-Preprocessing normalizes and converts layout across each batch, retaining each
-image's resize/padding metadata. Confidence and class filtering are vectorized
-across the batch. NMS runs independently per image; box transforms and mask
-reconstruction remain vectorized over detections, with bounded mask work chunks.
+Raw HWC frames are uploaded to CUDA before preprocessing. Numba CUDA kernels
+perform resize/padding, BGR-to-RGB conversion, NCHW layout conversion and
+normalization, including batch padding. TensorRT consumes the device tensor
+directly. Its outputs stay on CUDA for confidence/class filtering, per-image
+class-aware NMS, box transforms and mask reconstruction with bounded scratch
+storage. Only detection counts and final boxes/masks are copied to the CPU.
 Boxes and masks are returned in each original image's coordinates. Detection
 models retain stretch resizing, while segmentation models use letterboxing.
 
 For incremental consumption, `detector.model.predict(images, stream=True)` yields
 one result per image and executes one chunk at a time. `detect_n_seg` collects
-these results into a list. Each TensorRT instance owns reusable pinned host/device
-buffers and one execution context; use separate instances for concurrent calls.
+these results into a list. Each TensorRT instance owns reusable device buffers,
+pinned frame staging buffers, one CUDA stream and one execution context; use
+separate instances for concurrent calls. Numba and TensorRT share the CUDA primary
+context. The low-level `inf()` compatibility method still accepts preprocessed
+host NCHW tensors and returns raw NumPy outputs.
 ONNX batch inference is not supported by this wrapper.
+
+### Batch result format
+
+For `B` input images, the return value is a `list[DetectionResults]` of length
+`B`. `results[i]` belongs to `images[i]`. Each image can have a different number
+of detections `N` and different dimensions `H` and `W`.
+
+| Field on each result | Format | Meaning |
+| --- | --- | --- |
+| `boxes` | `float32`, `(N, 6)` | Rows: `[x1, y1, x2, y2, score, class_id]`. Coordinates are pixels in the original image. Tracking results may add a seventh `id` column. |
+| `xyxy` | `float32`, `(N, 4)` | Bounding boxes only. |
+| `scores` | `float32`, `(N,)` | Detection confidence. |
+| `class_ids` | Integer array, `(N,)` | Class indices. |
+| `names` | List or dictionary | Resolve a label with `result.names[int(class_id)]`. |
+| `masks` | Boolean array, `(N, H, W)`, or `None` | TensorRT segmentation masks aligned with box rows; `None` for detection-only models. |
+| `image_shape` | `(H, W, 3)` | Original TensorRT image shape; use `image_shape[:2]` for height and width. |
+| `areas` | `float32`, `(N,)` | Bounding-box areas in square pixels, not mask areas. |
+
+An image with no detections still has a result with `len(result) == 0` and
+`boxes.shape == (0, 6)`. Segmentation masks then have shape `(0, H, W)`;
+detection-only masks remain `None`. There is no single rectangular array for
+the batch because detection counts and image sizes may differ.
+
+For example, two images with two and zero detections produce:
+
+```text
+results = [DetectionResults, DetectionResults]
+results[0].boxes = [[10.0, 20.0, 110.0, 220.0, 0.95, 0.0],
+                    [150.0, 30.0, 250.0, 230.0, 0.88, 0.0]]
+results[1].boxes.shape = (0, 6)
+```
+
+Class `0` means `results[0].names[0]`, which depends on the model's labels.
+
+### Use batch results for further processing
+
+Keep each source image paired with its result. Boolean indexing filters boxes
+and masks together. Iterating a result yields objects with `object_class`,
+`conf`, integer `box`, `area`, and `maskxy` (the largest external mask contour,
+or an empty list when unavailable). Without a tracking column, `obj.id` is only
+the row index, not a persistent identity across images.
+
+This example filters detections, saves crops and annotated images, optionally
+saves foreground images, and exports metadata for another application:
+
+```python
+import json
+from pathlib import Path
+
+import cv2
+from person_inference import Detector
+
+paths = [Path("first.jpg"), Path("second.jpg")]
+images = []
+for path in paths:
+    image = cv2.imread(str(path))
+    if image is None:
+        raise FileNotFoundError(path)
+    images.append(image)
+
+detector = Detector("model.trt")
+results = detector.detect_n_seg(images, labels=["person"], score_threshold=0.5)
+output_dir = Path("batch_output")
+output_dir.mkdir(parents=True, exist_ok=True)
+records = []
+
+for image_index, (path, image, result) in enumerate(zip(paths, images, results)):
+    selected = result[(result.scores >= 0.7) & (result.areas >= 1000)]
+    prefix = f"{image_index}_{path.stem}"
+    cv2.imwrite(str(output_dir / f"{prefix}_annotated.jpg"), selected.plot(image))
+
+    detections = []
+    for object_index, obj in enumerate(selected):
+        crop = detector.crop(image, obj.box)
+        if crop.size:
+            cv2.imwrite(str(output_dir / f"{prefix}_crop_{object_index}.jpg"), crop)
+        detections.append({
+            "label": obj.object_class,
+            "score": obj.conf,
+            "box_xyxy": obj.box,
+        })
+
+    if selected.masks is not None:
+        # Union of selected masks: uint8 (H, W), values 0 or 1.
+        mask = selected.image_mask()
+        foreground = cv2.bitwise_and(image, image, mask=mask)
+        cv2.imwrite(str(output_dir / f"{prefix}_foreground.png"), foreground)
+
+    # Preserve the source record even when there are no selected detections.
+    records.append({"source": str(path), "detections": detections})
+
+(output_dir / "detections.json").write_text(json.dumps(records, indent=2))
+```
+
+For array-based processing, use `selected.xyxy`, `selected.scores`, and
+`selected.class_ids` directly; call `.tolist()` before JSON serialization.
+To retain individual masks, save `selected.masks` with `numpy.save` instead of
+expanding the arrays into JSON. For spatial matching within an image,
+`selected.intersects(other)` returns an `(N, M)` boolean matrix against another
+`DetectionResults` with `M` boxes in the same coordinate system.
